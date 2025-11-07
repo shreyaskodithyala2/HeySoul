@@ -21,9 +21,21 @@ class ActivityRecognizer:
             min_tracking_confidence=0.5
         )
         
+        # Initialize MediaPipe Face Detection for face extraction
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detection = self.mp_face_detection.FaceDetection(
+            min_detection_confidence=0.5
+        )
+        
         # Activity state tracking
         self.activity_history = deque(maxlen=30)  # Last 30 frames for smoothing
         self.movement_history = deque(maxlen=10)  # Track movement for walking detection
+        
+        # Timing
+        self.start_time = None
+        
+        # Canvas size
+        self.canvas_size = 400
         
     def calculate_angle(self, a, b, c):
         """Calculate angle between three points"""
@@ -129,6 +141,53 @@ class ActivityRecognizer:
         
         return activity, confidence
     
+    def extract_face(self, frame):
+        """Extract face region from frame and resize to 400x400"""
+        # Convert BGR to RGB for face detection
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Detect faces
+        results = self.face_detection.process(rgb_frame)
+        
+        # Create a blank 400x400 canvas
+        face_canvas = np.zeros((self.canvas_size, self.canvas_size, 3), dtype=np.uint8)
+        
+        if results.detections:
+            # Get the first detected face
+            detection = results.detections[0]
+            
+            # Get bounding box
+            bboxC = detection.location_data.relative_bounding_box
+            h, w, _ = frame.shape
+            
+            # Calculate coordinates with some padding
+            padding = 0.3  # 30% padding around face
+            x = int(max(0, (bboxC.xmin - padding * bboxC.width) * w))
+            y = int(max(0, (bboxC.ymin - padding * bboxC.height) * h))
+            width = int(min(w - x, bboxC.width * (1 + 2 * padding) * w))
+            height = int(min(h - y, bboxC.height * (1 + 2 * padding) * h))
+            
+            # Extract face region
+            face_roi = frame[y:y+height, x:x+width]
+            
+            if face_roi.size > 0:
+                # Resize face to 400x400
+                face_canvas = cv2.resize(face_roi, (self.canvas_size, self.canvas_size))
+                
+                # Draw detection box on face canvas for reference
+                cv2.rectangle(face_canvas, (10, 10), (self.canvas_size-10, self.canvas_size-10), 
+                            (0, 255, 0), 2)
+        else:
+            # No face detected - show message
+            cv2.putText(face_canvas, "No Face Detected", (50, 200),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        
+        # Add label
+        cv2.putText(face_canvas, "Face View", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        return face_canvas
+    
     def smooth_activity(self, current_activity):
         """Smooth activity detection over multiple frames"""
         self.activity_history.append(current_activity)
@@ -147,9 +206,15 @@ class ActivityRecognizer:
         return smoothed
     
     def process_frame(self, frame):
-        """Process a single frame and return annotated frame with activity"""
+        """Process a single frame and return annotated frame with activity + face extraction"""
+        # Resize frame to 400x400 for body activity view
+        frame_resized = cv2.resize(frame, (self.canvas_size, self.canvas_size))
+        
+        # Extract face before processing (use original frame for better quality)
+        face_frame = self.extract_face(frame)
+        
         # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         
         # Process the frame
         results = self.pose.process(rgb_frame)
@@ -162,7 +227,7 @@ class ActivityRecognizer:
         if results.pose_landmarks:
             # Draw skeleton
             self.mp_drawing.draw_landmarks(
-                frame,
+                frame_resized,
                 results.pose_landmarks,
                 self.mp_pose.POSE_CONNECTIONS,
                 self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
@@ -171,13 +236,13 @@ class ActivityRecognizer:
             
             # Detect activity
             landmarks = results.pose_landmarks.landmark
-            activity, confidence = self.detect_activity(landmarks, frame.shape[0])
+            activity, confidence = self.detect_activity(landmarks, frame_resized.shape[0])
             activity = self.smooth_activity(activity)
         
         # Add text overlay
-        self.add_overlay(frame, activity, confidence)
+        self.add_overlay(frame_resized, activity, confidence)
         
-        return frame, activity, confidence
+        return frame_resized, face_frame, activity, confidence
     
     def add_overlay(self, frame, activity, confidence):
         """Add text overlay with activity information"""
@@ -208,9 +273,16 @@ class ActivityRecognizer:
         print("Starting real-time activity recognition...")
         print("Press 'q' to quit")
         
+        self.start_time = time.time()  # Initialize start time
         fps_time = time.time()
         fps_counter = 0
         fps = 0
+        
+        # Position windows side by side
+        cv2.namedWindow('Body Activity', cv2.WINDOW_NORMAL)
+        cv2.namedWindow('Face View', cv2.WINDOW_NORMAL)
+        cv2.moveWindow('Body Activity', 50, 50)
+        cv2.moveWindow('Face View', 500, 50)
         
         while cap.isOpened():
             ret, frame = cap.read()
@@ -218,8 +290,11 @@ class ActivityRecognizer:
                 print("Failed to grab frame")
                 break
             
+            # Calculate elapsed time
+            elapsed_time = time.time() - self.start_time
+            
             # Process frame
-            annotated_frame, activity, confidence = self.process_frame(frame)
+            body_frame, face_frame, activity, confidence = self.process_frame(frame)
             
             # Calculate FPS
             fps_counter += 1
@@ -228,15 +303,20 @@ class ActivityRecognizer:
                 fps_counter = 0
                 fps_time = time.time()
             
-            # Display FPS
-            cv2.putText(annotated_frame, f"FPS: {fps}", (frame.shape[1] - 150, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            # Display FPS on body frame
+            cv2.putText(body_frame, f"FPS: {fps}", (body_frame.shape[1] - 120, 140),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
-            # Show frame
-            cv2.imshow('Activity Recognition', annotated_frame)
+            # Display elapsed time on body frame
+            cv2.putText(body_frame, f"Time: {elapsed_time:.1f}s", (body_frame.shape[1] - 120, 160),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
-            # Log activity
-            print(f"Activity: {activity} | Confidence: {confidence:.2f}")
+            # Show both frames
+            cv2.imshow('Body Activity', body_frame)
+            cv2.imshow('Face View', face_frame)
+            
+            # Log activity with timestamp
+            print(f"Time: {elapsed_time:.2f}s | Activity: {activity} | Confidence: {confidence:.2f}")
             
             # Quit on 'q'
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -256,9 +336,16 @@ class ActivityRecognizer:
         print(f"Processing video: {video_path}")
         print("Press 'q' to quit")
         
+        self.start_time = time.time()  # Initialize start time
         fps_time = time.time()
         fps_counter = 0
         fps = 0
+        
+        # Position windows side by side
+        cv2.namedWindow('Body Activity', cv2.WINDOW_NORMAL)
+        cv2.namedWindow('Face View', cv2.WINDOW_NORMAL)
+        cv2.moveWindow('Body Activity', 50, 50)
+        cv2.moveWindow('Face View', 500, 50)
         
         while cap.isOpened():
             ret, frame = cap.read()
@@ -266,8 +353,11 @@ class ActivityRecognizer:
                 print("End of video or failed to grab frame")
                 break
             
+            # Calculate elapsed time
+            elapsed_time = time.time() - self.start_time
+            
             # Process frame
-            annotated_frame, activity, confidence = self.process_frame(frame)
+            body_frame, face_frame, activity, confidence = self.process_frame(frame)
             
             # Calculate FPS
             fps_counter += 1
@@ -276,15 +366,20 @@ class ActivityRecognizer:
                 fps_counter = 0
                 fps_time = time.time()
             
-            # Display FPS
-            cv2.putText(annotated_frame, f"FPS: {fps}", (frame.shape[1] - 150, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            # Display FPS on body frame
+            cv2.putText(body_frame, f"FPS: {fps}", (body_frame.shape[1] - 120, 140),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
-            # Show frame
-            cv2.imshow('Activity Recognition', annotated_frame)
+            # Display elapsed time on body frame
+            cv2.putText(body_frame, f"Time: {elapsed_time:.1f}s", (body_frame.shape[1] - 120, 160),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
-            # Log activity
-            print(f"Activity: {activity} | Confidence: {confidence:.2f}")
+            # Show both frames
+            cv2.imshow('Body Activity', body_frame)
+            cv2.imshow('Face View', face_frame)
+            
+            # Log activity with timestamp
+            print(f"Time: {elapsed_time:.2f}s | Activity: {activity} | Confidence: {confidence:.2f}")
             
             # Quit on 'q'
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -296,6 +391,7 @@ class ActivityRecognizer:
     def cleanup(self):
         """Cleanup resources"""
         self.pose.close()
+        self.face_detection.close()
 
 
 def main():
