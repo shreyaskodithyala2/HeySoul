@@ -2,7 +2,9 @@
 """
 Real-time Activity Recognition System
 Detects patient activities: walking, sitting, standing, sleeping/lying down
-Uses MediaPipe Pose for skeletal tracking
+Detects facial expressions: happy, sad, angry, fear, surprise, neutral
+Detects objects near person using YOLOv8
+Uses MediaPipe Pose for skeletal tracking and FER for fast emotion detection
 """
 
 import cv2
@@ -10,6 +12,8 @@ import mediapipe as mp
 import numpy as np
 from collections import deque
 import time
+from fer import FER
+from ultralytics import YOLO
 
 class ActivityRecognizer:
     def __init__(self):
@@ -27,9 +31,27 @@ class ActivityRecognizer:
             min_detection_confidence=0.5
         )
         
+        # Initialize FER (Fast Emotion Recognition) for real-time emotion detection
+        print("Loading emotion detection model...")
+        self.emotion_detector = FER(mtcnn=False)  # Use faster detection without MTCNN
+        print("Emotion detection model loaded!")
+        
+        # Initialize YOLOv8 for object detection
+        print("Loading YOLOv8 object detection model...")
+        self.yolo_model = YOLO('yolov8n.pt')  # Using nano version for speed
+        print("YOLOv8 model loaded!")
+        
         # Activity state tracking
         self.activity_history = deque(maxlen=30)  # Last 30 frames for smoothing
         self.movement_history = deque(maxlen=10)  # Track movement for walking detection
+        
+        # Emotion tracking
+        self.emotion_history = deque(maxlen=5)  # Smaller history for faster response
+        self.last_emotion = "neutral"
+        self.last_emotion_confidence = 0.0
+        
+        # Object detection tracking
+        self.detected_objects = []
         
         # Timing
         self.start_time = None
@@ -37,6 +59,122 @@ class ActivityRecognizer:
         # Canvas size
         self.canvas_size = 400
         
+    def detect_objects_near_person(self, frame, person_bbox=None):
+        """
+        Detect objects in the frame using YOLOv8
+        Returns: list of detected objects with their locations
+        """
+        try:
+            # Run YOLOv8 detection
+            results = self.yolo_model(frame, verbose=False)
+            
+            detected_objects = []
+            
+            for result in results:
+                boxes = result.boxes
+                for box in boxes:
+                    # Get box coordinates
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    confidence = float(box.conf[0])
+                    class_id = int(box.cls[0])
+                    class_name = self.yolo_model.names[class_id]
+                    
+                    # Only include objects with confidence > 0.5
+                    if confidence > 0.5:
+                        # Calculate distance from person (if person bbox is available)
+                        distance = "unknown"
+                        if person_bbox is not None:
+                            person_center = ((person_bbox[0] + person_bbox[2]) / 2, 
+                                           (person_bbox[1] + person_bbox[3]) / 2)
+                            object_center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                            pixel_distance = np.sqrt(
+                                (person_center[0] - object_center[0])**2 + 
+                                (person_center[1] - object_center[1])**2
+                            )
+                            
+                            # Categorize distance (relative to frame size)
+                            frame_diagonal = np.sqrt(frame.shape[0]**2 + frame.shape[1]**2)
+                            relative_distance = pixel_distance / frame_diagonal
+                            
+                            if relative_distance < 0.2:
+                                distance = "very close"
+                            elif relative_distance < 0.4:
+                                distance = "close"
+                            elif relative_distance < 0.6:
+                                distance = "medium"
+                            else:
+                                distance = "far"
+                        
+                        detected_objects.append({
+                            'name': class_name,
+                            'confidence': confidence,
+                            'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                            'distance': distance
+                        })
+            
+            self.detected_objects = detected_objects
+            return detected_objects
+            
+        except Exception as e:
+            print(f"Error in object detection: {e}")
+            return []
+    
+    def draw_objects_on_frame(self, frame, objects):
+        """Draw bounding boxes and labels for detected objects"""
+        for obj in objects:
+            x1, y1, x2, y2 = obj['bbox']
+            
+            # Color based on distance
+            color_map = {
+                'very close': (0, 0, 255),    # Red - potential risk
+                'close': (0, 165, 255),        # Orange
+                'medium': (0, 255, 255),       # Yellow
+                'far': (0, 255, 0),            # Green
+                'unknown': (255, 255, 255)     # White
+            }
+            color = color_map.get(obj['distance'], (255, 255, 255))
+            
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw label
+            label = f"{obj['name']} ({obj['confidence']:.2f})"
+            if obj['distance'] != 'unknown':
+                label += f" - {obj['distance']}"
+            
+            # Background for text
+            (text_width, text_height), _ = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            )
+            cv2.rectangle(frame, (x1, y1 - text_height - 10), 
+                         (x1 + text_width, y1), color, -1)
+            
+            # Text
+            cv2.putText(frame, label, (x1, y1 - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        return frame
+    
+    def get_person_bbox(self, landmarks, frame_shape):
+        """Get bounding box of person from pose landmarks"""
+        if not landmarks:
+            return None
+        
+        h, w = frame_shape[:2]
+        
+        # Get all landmark coordinates
+        x_coords = [lm.x * w for lm in landmarks]
+        y_coords = [lm.y * h for lm in landmarks]
+        
+        # Calculate bounding box with some padding
+        padding = 20
+        x1 = max(0, int(min(x_coords)) - padding)
+        y1 = max(0, int(min(y_coords)) - padding)
+        x2 = min(w, int(max(x_coords)) + padding)
+        y2 = min(h, int(max(y_coords)) + padding)
+        
+        return (x1, y1, x2, y2)
+    
     def calculate_angle(self, a, b, c):
         """Calculate angle between three points"""
         a = np.array([a.x, a.y])
@@ -141,6 +279,54 @@ class ActivityRecognizer:
         
         return activity, confidence
     
+    def detect_facial_expression(self, face_frame):
+        """
+        Detect facial expression using FER (Fast Emotion Recognition)
+        Returns: emotion name and confidence
+        This is optimized for real-time performance
+        """
+        try:
+            # Check if face frame is valid
+            if face_frame is None or face_frame.size == 0:
+                return self.last_emotion, self.last_emotion_confidence
+            
+            # Check if it's just a black frame (no face detected)
+            if np.mean(face_frame) < 10:
+                return "No Face", 0.0
+            
+            # Detect emotions using FER (this is MUCH faster than DeepFace)
+            emotions = self.emotion_detector.detect_emotions(face_frame)
+            
+            if emotions and len(emotions) > 0:
+                # Get the first face's emotions
+                emotion_scores = emotions[0]['emotions']
+                
+                # Find dominant emotion
+                dominant_emotion = max(emotion_scores, key=emotion_scores.get)
+                confidence = emotion_scores[dominant_emotion]
+                
+                # Update history for smoothing
+                self.emotion_history.append(dominant_emotion)
+                self.last_emotion = dominant_emotion
+                self.last_emotion_confidence = confidence
+                
+                # Smooth emotion detection over last few frames
+                if len(self.emotion_history) >= 3:
+                    emotion_counts = {}
+                    for em in list(self.emotion_history):
+                        emotion_counts[em] = emotion_counts.get(em, 0) + 1
+                    smoothed_emotion = max(emotion_counts, key=emotion_counts.get)
+                    return smoothed_emotion, confidence
+                
+                return dominant_emotion, confidence
+            else:
+                # No emotions detected, return last known
+                return self.last_emotion, self.last_emotion_confidence
+            
+        except Exception as e:
+            # If detection fails, return last known emotion
+            return self.last_emotion, self.last_emotion_confidence
+    
     def extract_face(self, frame):
         """Extract face region from frame and resize to 400x400"""
         # Convert BGR to RGB for face detection
@@ -151,6 +337,7 @@ class ActivityRecognizer:
         
         # Create a blank 400x400 canvas
         face_canvas = np.zeros((self.canvas_size, self.canvas_size, 3), dtype=np.uint8)
+        raw_face = None
         
         if results.detections:
             # Get the first detected face
@@ -173,6 +360,7 @@ class ActivityRecognizer:
             if face_roi.size > 0:
                 # Resize face to 400x400
                 face_canvas = cv2.resize(face_roi, (self.canvas_size, self.canvas_size))
+                raw_face = face_canvas.copy()  # Keep raw face for emotion detection
                 
                 # Draw detection box on face canvas for reference
                 cv2.rectangle(face_canvas, (10, 10), (self.canvas_size-10, self.canvas_size-10), 
@@ -186,7 +374,7 @@ class ActivityRecognizer:
         cv2.putText(face_canvas, "Face View", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
-        return face_canvas
+        return face_canvas, raw_face
     
     def smooth_activity(self, current_activity):
         """Smooth activity detection over multiple frames"""
@@ -206,22 +394,36 @@ class ActivityRecognizer:
         return smoothed
     
     def process_frame(self, frame):
-        """Process a single frame and return annotated frame with activity + face extraction"""
+        """Process a single frame and return annotated frame with activity + face extraction + emotion + objects"""
         # Resize frame to 400x400 for body activity view
         frame_resized = cv2.resize(frame, (self.canvas_size, self.canvas_size))
         
         # Extract face before processing (use original frame for better quality)
-        face_frame = self.extract_face(frame)
+        face_frame, raw_face = self.extract_face(frame)
+        
+        # Detect facial expression
+        emotion = "No Face"
+        emotion_confidence = 0.0
+        if raw_face is not None:
+            emotion, emotion_confidence = self.detect_facial_expression(raw_face)
+        
+        # Add emotion info to face frame
+        emotion_color = self.get_emotion_color(emotion)
+        cv2.putText(face_frame, f"Emotion: {emotion}", (10, 360),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, emotion_color, 2)
+        cv2.putText(face_frame, f"Conf: {emotion_confidence:.2f}", (10, 390),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         
-        # Process the frame
+        # Process the frame for pose
         results = self.pose.process(rgb_frame)
         
         # Initialize activity
         activity = "No Person Detected"
         confidence = 0.0
+        person_bbox = None
         
         # Draw pose landmarks and detect activity
         if results.pose_landmarks:
@@ -238,31 +440,71 @@ class ActivityRecognizer:
             landmarks = results.pose_landmarks.landmark
             activity, confidence = self.detect_activity(landmarks, frame_resized.shape[0])
             activity = self.smooth_activity(activity)
+            
+            # Get person bounding box
+            person_bbox = self.get_person_bbox(landmarks, frame_resized.shape)
+        
+        # Detect objects near person using YOLOv8 (on resized frame)
+        detected_objects = self.detect_objects_near_person(frame_resized, person_bbox)
+        
+        # Draw objects on frame
+        frame_resized = self.draw_objects_on_frame(frame_resized, detected_objects)
         
         # Add text overlay
-        self.add_overlay(frame_resized, activity, confidence)
+        self.add_overlay(frame_resized, activity, confidence, detected_objects)
         
-        return frame_resized, face_frame, activity, confidence
+        return frame_resized, face_frame, activity, confidence, emotion, emotion_confidence, detected_objects
     
-    def add_overlay(self, frame, activity, confidence):
-        """Add text overlay with activity information"""
+    def get_emotion_color(self, emotion):
+        """Get color for emotion display"""
+        emotion_colors = {
+            'happy': (0, 255, 0),      # Green
+            'sad': (255, 0, 0),        # Blue
+            'angry': (0, 0, 255),      # Red
+            'fear': (255, 0, 255),     # Magenta
+            'surprise': (0, 255, 255), # Yellow
+            'disgust': (128, 0, 128),  # Purple
+            'neutral': (255, 255, 255) # White
+        }
+        return emotion_colors.get(emotion.lower(), (255, 255, 255))
+    
+    def add_overlay(self, frame, activity, confidence, detected_objects=[]):
+        """Add text overlay with activity information and object count"""
         # Semi-transparent background for text
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (500, 120), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (10, 10), (500, 150), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
         
         # Activity text
-        cv2.putText(frame, f"Activity: {activity}", (20, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+        cv2.putText(frame, f"Activity: {activity}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
         # Confidence bar
-        cv2.putText(frame, f"Confidence: {confidence:.2f}", (20, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"Confidence: {confidence:.2f}", (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         
         # Confidence bar visualization
-        bar_length = int(confidence * 300)
-        cv2.rectangle(frame, (180, 100), (180 + bar_length, 110), (0, 255, 0), -1)
-        cv2.rectangle(frame, (180, 100), (480, 110), (255, 255, 255), 2)
+        bar_length = int(confidence * 200)
+        cv2.rectangle(frame, (150, 60), (150 + bar_length, 75), (0, 255, 0), -1)
+        cv2.rectangle(frame, (150, 60), (350, 75), (255, 255, 255), 2)
+        
+        # Objects detected
+        if detected_objects:
+            object_count = len(detected_objects)
+            cv2.putText(frame, f"Objects Nearby: {object_count}", (20, 100),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # Count objects by distance category
+            close_objects = [obj for obj in detected_objects if obj['distance'] in ['very close', 'close']]
+            if close_objects:
+                close_names = ', '.join([obj['name'] for obj in close_objects[:3]])
+                if len(close_objects) > 3:
+                    close_names += f" +{len(close_objects)-3}"
+                cv2.putText(frame, f"Close: {close_names}", (20, 130),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        else:
+            cv2.putText(frame, f"Objects Nearby: 0", (20, 100),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
         
         return frame
     
@@ -294,7 +536,7 @@ class ActivityRecognizer:
             elapsed_time = time.time() - self.start_time
             
             # Process frame
-            body_frame, face_frame, activity, confidence = self.process_frame(frame)
+            body_frame, face_frame, activity, confidence, emotion, emotion_confidence, detected_objects = self.process_frame(frame)
             
             # Calculate FPS
             fps_counter += 1
@@ -304,19 +546,22 @@ class ActivityRecognizer:
                 fps_time = time.time()
             
             # Display FPS on body frame
-            cv2.putText(body_frame, f"FPS: {fps}", (body_frame.shape[1] - 120, 140),
+            cv2.putText(body_frame, f"FPS: {fps}", (body_frame.shape[1] - 120, 170),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
             # Display elapsed time on body frame
-            cv2.putText(body_frame, f"Time: {elapsed_time:.1f}s", (body_frame.shape[1] - 120, 160),
+            cv2.putText(body_frame, f"Time: {elapsed_time:.1f}s", (body_frame.shape[1] - 120, 190),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
             # Show both frames
             cv2.imshow('Body Activity', body_frame)
             cv2.imshow('Face View', face_frame)
             
-            # Log activity with timestamp
-            print(f"Time: {elapsed_time:.2f}s | Activity: {activity} | Confidence: {confidence:.2f}")
+            # Log activity with timestamp, emotion, and objects
+            objects_str = ", ".join([obj['name'] for obj in detected_objects]) if detected_objects else "None"
+            print(f"Time: {elapsed_time:.2f}s | Activity: {activity} | Confidence: {confidence:.2f} | "
+                  f"Facial Expression: {emotion} | Emotion Confidence: {emotion_confidence:.2f} | "
+                  f"Objects: {objects_str}")
             
             # Quit on 'q'
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -357,7 +602,7 @@ class ActivityRecognizer:
             elapsed_time = time.time() - self.start_time
             
             # Process frame
-            body_frame, face_frame, activity, confidence = self.process_frame(frame)
+            body_frame, face_frame, activity, confidence, emotion, emotion_confidence, detected_objects = self.process_frame(frame)
             
             # Calculate FPS
             fps_counter += 1
@@ -367,19 +612,22 @@ class ActivityRecognizer:
                 fps_time = time.time()
             
             # Display FPS on body frame
-            cv2.putText(body_frame, f"FPS: {fps}", (body_frame.shape[1] - 120, 140),
+            cv2.putText(body_frame, f"FPS: {fps}", (body_frame.shape[1] - 120, 170),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
             # Display elapsed time on body frame
-            cv2.putText(body_frame, f"Time: {elapsed_time:.1f}s", (body_frame.shape[1] - 120, 160),
+            cv2.putText(body_frame, f"Time: {elapsed_time:.1f}s", (body_frame.shape[1] - 120, 190),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
             
             # Show both frames
             cv2.imshow('Body Activity', body_frame)
             cv2.imshow('Face View', face_frame)
             
-            # Log activity with timestamp
-            print(f"Time: {elapsed_time:.2f}s | Activity: {activity} | Confidence: {confidence:.2f}")
+            # Log activity with timestamp, emotion, and objects
+            objects_str = ", ".join([obj['name'] for obj in detected_objects]) if detected_objects else "None"
+            print(f"Time: {elapsed_time:.2f}s | Activity: {activity} | Confidence: {confidence:.2f} | "
+                  f"Facial Expression: {emotion} | Emotion Confidence: {emotion_confidence:.2f} | "
+                  f"Objects: {objects_str}")
             
             # Quit on 'q'
             if cv2.waitKey(1) & 0xFF == ord('q'):
